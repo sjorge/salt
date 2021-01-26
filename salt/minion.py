@@ -27,11 +27,9 @@ import salt.crypt
 import salt.defaults.events
 import salt.defaults.exitcodes
 import salt.engines
-
-# pylint: enable=no-name-in-module,redefined-builtin
 import salt.ext.tornado
-import salt.ext.tornado.gen  # pylint: disable=F0401
-import salt.ext.tornado.ioloop  # pylint: disable=F0401
+import salt.ext.tornado.gen
+import salt.ext.tornado.ioloop
 import salt.loader
 import salt.log.setup
 import salt.payload
@@ -71,8 +69,6 @@ from salt.exceptions import (
     SaltReqTimeoutError,
     SaltSystemExit,
 )
-
-# pylint: disable=import-error,no-name-in-module,redefined-builtin
 from salt.template import SLS_ENCODING
 from salt.utils.ctx import RequestContext
 from salt.utils.debug import enable_sigusr1_handler
@@ -1036,6 +1032,8 @@ class MinionManager(MinionBase):
         self.io_loop.spawn_callback(
             self.process_manager.run, **{"asynchronous": True}
         )  # Tornado backward compat
+        self.event_publisher = None
+        self.event = None
 
     # pylint: disable=W1701
     def __del__(self):
@@ -1193,12 +1191,22 @@ class MinionManager(MinionBase):
             # kill any remaining processes
             minion.process_manager.kill_children()
             minion.destroy()
-        self.event.destroy()
+        if self.event_publisher is not None:
+            self.event_publisher.close()
+            self.event_publisher = None
+        if self.event is not None:
+            self.event.destroy()
+            self.event = None
 
     def destroy(self):
         for minion in self.minions:
             minion.destroy()
-        self.event.destroy()
+        if self.event_publisher is not None:
+            self.event_publisher.close()
+            self.event_publisher = None
+        if self.event is not None:
+            self.event.destroy()
+            self.event = None
 
 
 class Minion(MinionBase):
@@ -1575,11 +1583,12 @@ class Minion(MinionBase):
             load["sig"] = sig
 
         with salt.transport.client.ReqChannel.factory(self.opts) as channel:
-            return channel.send(load, timeout=timeout)
+            return channel.send(
+                load, timeout=timeout, tries=self.opts["return_retry_tries"]
+            )
 
     @salt.ext.tornado.gen.coroutine
     def _send_req_async(self, load, timeout):
-
         if self.opts["minion_sign_messages"]:
             log.trace("Signing event to be published onto the bus.")
             minion_privkey_path = os.path.join(self.opts["pki_dir"], "minion.pem")
@@ -1589,7 +1598,9 @@ class Minion(MinionBase):
             load["sig"] = sig
 
         with salt.transport.client.AsyncReqChannel.factory(self.opts) as channel:
-            ret = yield channel.send(load, timeout=timeout)
+            ret = yield channel.send(
+                load, timeout=timeout, tries=self.opts["return_retry_tries"]
+            )
             raise salt.ext.tornado.gen.Return(ret)
 
     def _fire_master(
@@ -2570,7 +2581,11 @@ class Minion(MinionBase):
         with salt.transport.client.ReqChannel.factory(self.opts) as channel:
             data["tok"] = self.tok
             try:
-                ret = channel.send(data)
+                ret = channel.send(
+                    data,
+                    timeout=self._return_retry_timer(),
+                    tries=self.opts["return_retry_tries"],
+                )
                 return ret
             except SaltReqTimeoutError:
                 log.warning("Unable to send mine data to master.")
@@ -3134,6 +3149,8 @@ class Syndic(Minion):
     """
 
     def __init__(self, opts, **kwargs):
+        self.local = None
+        self.forward_events = None
         self._syndic_interface = opts.get("interface")
         self._syndic = True
         # force auth_safemode True because Syndic don't support autorestart
@@ -3256,11 +3273,13 @@ class Syndic(Minion):
         # We borrowed the local clients poller so give it back before
         # it's destroyed. Reset the local poller reference.
         super().destroy()
-        if hasattr(self, "local"):
-            del self.local
+        if self.local is not None:
+            self.local.destroy()
+            self.local = None
 
-        if hasattr(self, "forward_events"):
+        if self.forward_events is not None:
             self.forward_events.stop()
+            self.forward_events = None
 
 
 # TODO: need a way of knowing if the syndic connection is busted
@@ -3291,6 +3310,7 @@ class SyndicManager(MinionBase):
     def __init__(self, opts, io_loop=None):
         opts["loop_interval"] = 1
         super().__init__(opts)
+        self._closing = False
         self.mminion = salt.minion.MasterMinion(opts)
         # sync (old behavior), cluster (only returns and publishes)
         self.syndic_mode = self.opts.get("syndic_mode", "sync")
@@ -3602,6 +3622,13 @@ class SyndicManager(MinionBase):
             res = self._return_pub_syndic(values, master_id=master)
             if res:
                 del self.job_rets[master]
+
+    def destroy(self):
+        if self._closing is True:
+            return
+        self._closing = True
+        if self.local is not None:
+            self.local.destroy()
 
 
 class ProxyMinionManager(MinionManager):
